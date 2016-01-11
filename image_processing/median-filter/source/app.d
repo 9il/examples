@@ -1,5 +1,6 @@
 import mir.ndslice;
 
+import std.parallelism;
 /++
 A median filter is implemented as an example. The function
 `movingWindowByChannel` can also be used with other filters that use a sliding
@@ -31,13 +32,9 @@ Returns:
         where с is the number of channels in the image.
         Dense data layout is guaranteed.
 +/
-
 Slice!(3, C*) movingWindowByChannel(alias filter, C)
 (Slice!(3, C*) image, size_t nr, size_t nc)
 {
-    import std.algorithm.iteration: map;
-    import std.array: array;
-
         // 0. 3D
         // The last dimension represents the color channel.
     auto wnds = image
@@ -57,16 +54,16 @@ Slice!(3, C*) movingWindowByChannel(alias filter, C)
         // Packs the last two dimensions.
         .pack!2;
 
-    return wnds
-        // 6. Range composed of 2D
-        // Gathers all windows in the range.
-        .byElement
+    // 6. Range composed of 2D
+    // Gathers all windows in the range.
+    auto lazyRange = wnds.byElement;
+
+    return 
         // 7. Range composed of pixels
         // 2D to pixel lazy conversion.
-        .map!filter
         // 8. `C[]`
-        // The only memory allocation in this function.
-        .array
+        // The only memory allocation in this function with parallel initilization.
+        taskPool().amap!filter(lazyRange) // Uses default task pool
         // 9. 3D
         // Returns slice with corresponding shape.
         .sliced(wnds.shape);
@@ -75,20 +72,23 @@ Slice!(3, C*) movingWindowByChannel(alias filter, C)
 /++
 Params:
     r = input range
-    buf = buffer with length no less than the number of elements in `r`
+    pool = pool of tasks
 Returns:
     median value over the range `r`
 +/
-T median(Range, T)(Range r, T[] buf)
+ubyte median(Window)(Window w)
 {
     import std.algorithm.sorting: sort;
     size_t n;
-    foreach (e; r)
+    auto buf = buffers[taskPool().workerIndex];
+    foreach (e; w.byElement)
         buf[n++] = e;
     buf[0 .. n].sort();
     immutable m = n >> 1;
-    return n & 1 ? buf[m] : cast(T)((buf[m - 1] + buf[m]) / 2);
+    return n & 1 ? buf[m] : cast(ubyte)((buf[m - 1] + buf[m]) / 2);
 }
+
+shared ubyte[][] buffers;
 
 /++
 This program works both with color and grayscale images.
@@ -113,7 +113,7 @@ void main(string[] args)
     if (!nr) nr = def;
     if (!nc) nc = nr;
 
-    auto buf = new ubyte[nr * nc];
+    auto buffers = new shared ubyte[][](nr * nc, defaultPoolThreads() + 1);
 
     foreach (name; args[1 .. $])
     {
@@ -123,9 +123,7 @@ void main(string[] args)
 
         auto ret = image.pixels
             .sliced(cast(size_t)image.h, cast(size_t)image.w, cast(size_t)image.c)
-            .movingWindowByChannel
-                !(window => median(window.byElement, buf))
-                 (nr, nc);
+            .movingWindowByChannel!median(nr, nc);
 
         write_image(
             name.stripExtension ~ "_filtered.png",
